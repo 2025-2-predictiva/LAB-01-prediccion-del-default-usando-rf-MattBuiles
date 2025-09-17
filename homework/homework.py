@@ -3,7 +3,7 @@
 # En este dataset se desea pronosticar el default (pago) del cliente el próximo
 # mes a partir de 23 variables explicativas.
 #
-#   LIMIT_BAL: Monto del credito otorgado. Incluye el credito individual y el
+#   LIMIT_BAL: Monto del credit orgado. Incluye el credito individual y el
 #              credito familiar (suplementario).
 #         SEX: Genero (1=male; 2=female).
 #   EDUCATION: Educacion (0=N/A; 1=graduate school; 2=university; 3=high school; 4=others).
@@ -92,3 +92,179 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+
+# Paso 1
+
+import zipfile
+import os
+import pandas as pd
+import numpy as np
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+from sklearn.model_selection import cross_val_score
+import joblib
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import make_scorer, balanced_accuracy_score
+import gzip
+import pickle
+import json
+from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score
+
+
+
+
+
+zip_path1 = "files/input/train_data.csv.zip"
+zip_path2 = "files/input/test_data.csv.zip"
+extract_path = "files/input/"
+
+if not os.path.exists("files/input/train_default_of_credit_card_clients.csv"):
+  with zipfile.ZipFile(zip_path1, 'r') as zip_ref:
+      zip_ref.extractall(extract_path)
+
+if not os.path.exists("files/input/test_default_of_credit_card_clients.csv"):
+  with zipfile.ZipFile(zip_path2, 'r') as zip_ref:
+    zip_ref.extractall(extract_path)
+
+train = pd.read_csv("files/input/train_default_of_credit_card_clients.csv")
+test = pd.read_csv("files/input/test_default_of_credit_card_clients.csv")
+
+train = train.rename(columns={"default payment next month": "default"})
+test = test.rename(columns={"default payment next month": "default"})
+
+train = train.drop(columns=["ID"])
+test = test.drop(columns=["ID"])
+
+
+train["EDUCATION"] = train["EDUCATION"].replace(0, np.nan)
+test["EDUCATION"] = test["EDUCATION"].replace(0, np.nan)
+
+train = train.dropna()
+test = test.dropna()
+
+train.loc[train["EDUCATION"] > 4, "EDUCATION"] = 4
+test.loc[test["EDUCATION"] > 4, "EDUCATION"] = 4
+
+map_edu = {4: "others"}
+train["EDUCATION"] = train["EDUCATION"].clip(upper=4).map(map_edu)
+
+train = train.drop_duplicates()
+test = test.drop_duplicates()
+
+# Paso 2
+x_train = train.drop("default", axis=1)
+y_train = train["default"]
+
+x_test = test.drop("default", axis=1)
+y_test = test["default"]
+
+# Paso 3
+categorical_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+
+numeric_cols = [c for c in x_train.columns if c not in categorical_cols]
+
+categorical_pipeline = Pipeline(steps=[
+   ("imputer", SimpleImputer(strategy="most_frequent")),
+   ("ohe", OneHotEncoder(handle_unknown="ignore"))
+])
+
+numeric_pipeline = Pipeline(steps=[
+   ("imputer",SimpleImputer(strategy="median")),
+   ("scaler", StandardScaler())
+])
+
+preprocessor = ColumnTransformer(transformers=[
+   ("cat", categorical_pipeline, categorical_cols),
+   ("num", numeric_pipeline, numeric_cols)
+])
+
+clf_pipeline = Pipeline(steps=[
+   ("preprocessor", preprocessor),
+   ("rf", RandomForestClassifier(random_state=42))
+])
+
+clf_pipeline.fit(x_train, y_train)
+
+y_pred = clf_pipeline.predict(x_test)
+
+param_grid = {
+    'rf__n_estimators': [100, 200, 300],
+    'rf__max_depth': [10, 20, 30, None],
+    'rf__min_samples_split': [2, 5, 10],
+    'rf__min_samples_leaf': [1, 2, 4],
+    'rf__max_features': ['sqrt', 'log2']
+}
+
+grid_search = GridSearchCV(
+   estimator=clf_pipeline,
+   param_grid=param_grid,
+   cv=5,
+   scoring='balanced_accuracy',
+   n_jobs=-1,
+   verbose=2
+)
+
+grid_search.fit(x_train, y_train)
+
+print("Mejores hiperparámetros:", grid_search.best_params_)
+print("Mejor balanced accuracy (CV):", grid_search.best_score_)
+
+best_model = grid_search.best_estimator_
+y_pred = best_model.predict(x_test)
+
+print("Balanced Accuracy en test:",
+      balanced_accuracy_score(y_test, y_pred))
+
+# Paso 5: Guardar el modelo comprimido con gzip
+with gzip.open("files/models/model.pkl.gz", "wb") as f:
+    pickle.dump(grid_search, f)
+
+# Cargar el modelo guardado para verificar
+with gzip.open("files/models/model.pkl.gz", "rb") as f:
+    loaded_model = pickle.load(f)
+
+print(type(loaded_model))
+print(loaded_model.predict(x_test[:5]))
+
+def compute_metrics(model, X, y, dataset_name):
+    y_pred = model.predict(X)
+    return {
+        "type": "metrics",
+        "dataset": dataset_name,
+        "precision": precision_score(y, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y, y_pred),
+        "recall": recall_score(y, y_pred, zero_division=0),
+        "f1_score": f1_score(y, y_pred, zero_division=0)
+    }
+
+metrics_train = compute_metrics(best_model, x_train, y_train, "train")
+metrics_test  = compute_metrics(best_model, x_test, y_test, "test")
+
+
+def compute_confusion_matrix(model, X, y, dataset_name):
+    y_pred = model.predict(X)
+    cm = confusion_matrix(y, y_pred, labels=[0, 1])
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_name,
+        "true_0": {"predicted_0": int(cm[0, 0]), "predicted_1": int(cm[0, 1])},
+        "true_1": {"predicted_0": int(cm[1, 0]), "predicted_1": int(cm[1, 1])}
+    }
+
+cm_train = compute_confusion_matrix(best_model, x_train, y_train, "train")
+cm_test  = compute_confusion_matrix(best_model, x_test, y_test, "test")
+
+results = [metrics_train, metrics_test, cm_train, cm_test]
+
+output_path = "files/output/metrics.json"
+with open(output_path, "w") as f:
+    for entry in results:
+        f.write(json.dumps(entry) + "\n")
+
+print("Métricas guardadas en:", output_path)
